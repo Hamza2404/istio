@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors.
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,17 +22,39 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"istio.io/istio/pilot/pkg/proxy/envoy/v2"
+	xdsapi "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	xdsstatus "github.com/envoyproxy/go-control-plane/envoy/service/status/v3"
+
+	"istio.io/istio/istioctl/pkg/multixds"
+	"istio.io/istio/pilot/pkg/xds"
+	xdsresource "istio.io/istio/pilot/pkg/xds/v3"
+	"istio.io/pkg/log"
 )
 
-// StatusWriter enables printing of sync status using multiple []byte Pilot responses
+// StatusWriter enables printing of sync status using multiple []byte Istiod responses
 type StatusWriter struct {
 	Writer io.Writer
 }
 
 type writerStatus struct {
 	pilot string
-	v2.SyncStatus
+	xds.SyncStatus
+}
+
+// XdsStatusWriter enables printing of sync status using multiple xdsapi.DiscoveryResponse Istiod responses
+type XdsStatusWriter struct {
+	Writer                 io.Writer
+	InternalDebugAllIstiod bool
+}
+
+type xdsWriterStatus struct {
+	proxyID        string
+	istiodID       string
+	istiodVersion  string
+	clusterStatus  string
+	listenerStatus string
+	routeStatus    string
+	endpointStatus string
 }
 
 // PrintAll takes a slice of Pilot syncz responses and outputs them using a tabwriter
@@ -67,10 +89,10 @@ func (s *StatusWriter) PrintSingle(statuses map[string][]byte, proxyName string)
 
 func (s *StatusWriter) setupStatusPrint(statuses map[string][]byte) (*tabwriter.Writer, []*writerStatus, error) {
 	w := new(tabwriter.Writer).Init(s.Writer, 0, 8, 5, ' ', 0)
-	fmt.Fprintln(w, "PROXY\tCDS\tLDS\tEDS\tRDS\tPILOT\tVERSION")
-	fullStatus := []*writerStatus{}
+	_, _ = fmt.Fprintln(w, "NAME\tCDS\tLDS\tEDS\tRDS\tISTIOD\tVERSION")
+	fullStatus := make([]*writerStatus, 0, len(statuses))
 	for pilot, status := range statuses {
-		ss := []*writerStatus{}
+		var ss []*writerStatus
 		err := json.Unmarshal(status, &ss)
 		if err != nil {
 			return nil, nil, err
@@ -91,8 +113,15 @@ func statusPrintln(w io.Writer, status *writerStatus) error {
 	listenerSynced := xdsStatus(status.ListenerSent, status.ListenerAcked)
 	routeSynced := xdsStatus(status.RouteSent, status.RouteAcked)
 	endpointSynced := xdsStatus(status.EndpointSent, status.EndpointAcked)
-	fmt.Fprintf(w, "%v\t%v\t%v\t%v (%v%%)\t%v\t%v\t%v\n",
-		status.ProxyID, clusterSynced, listenerSynced, endpointSynced, status.EndpointPercent, routeSynced, status.pilot, status.ProxyVersion)
+	version := status.IstioVersion
+	if version == "" {
+		// If we can't find an Istio version (talking to a 1.1 pilot), fallback to the proxy version
+		// This is misleading, as the proxy version isn't always the same as the Istio version,
+		// but it is better than not providing any information.
+		version = status.ProxyVersion + "*"
+	}
+	_, _ = fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\t%v\n",
+		status.ProxyID, clusterSynced, listenerSynced, endpointSynced, routeSynced, status.pilot, version)
 	return nil
 }
 
@@ -103,5 +132,148 @@ func xdsStatus(sent, acked string) string {
 	if sent == acked {
 		return "SYNCED"
 	}
+	// acked will be empty string when there is never Acknowledged
+	if acked == "" {
+		return "STALE (Never Acknowledged)"
+	}
+	// Since the Nonce changes to uuid, so there is no more any time diff info
 	return "STALE"
+}
+
+// PrintAll takes a slice of Istiod syncz responses and outputs them using a tabwriter
+func (s *XdsStatusWriter) PrintAll(statuses map[string]*xdsapi.DiscoveryResponse) error {
+	w, fullStatus, err := s.setupStatusPrint(statuses)
+	if err != nil {
+		return err
+	}
+	for _, status := range fullStatus {
+		if err := xdsStatusPrintln(w, status); err != nil {
+			return err
+		}
+	}
+	if w != nil {
+		return w.Flush()
+	}
+	return nil
+}
+
+func (s *XdsStatusWriter) setupStatusPrint(drs map[string]*xdsapi.DiscoveryResponse) (*tabwriter.Writer, []*xdsWriterStatus, error) {
+	// Gather the statuses before printing so they may be sorted
+	var fullStatus []*xdsWriterStatus
+	mappedResp := map[string]string{}
+	var w *tabwriter.Writer
+	for id, dr := range drs {
+		for _, resource := range dr.Resources {
+			switch resource.TypeUrl {
+			case "type.googleapis.com/envoy.service.status.v3.ClientConfig":
+				clientConfig := xdsstatus.ClientConfig{}
+				err := resource.UnmarshalTo(&clientConfig)
+				if err != nil {
+					return nil, nil, fmt.Errorf("could not unmarshal ClientConfig: %w", err)
+				}
+				cds, lds, eds, rds := getSyncStatus(&clientConfig)
+				cp := multixds.CpInfo(dr)
+				fullStatus = append(fullStatus, &xdsWriterStatus{
+					proxyID:        clientConfig.GetNode().GetId(),
+					istiodID:       cp.ID,
+					istiodVersion:  cp.Info.Version,
+					clusterStatus:  cds,
+					listenerStatus: lds,
+					routeStatus:    rds,
+					endpointStatus: eds,
+				})
+				if len(fullStatus) == 0 {
+					return nil, nil, fmt.Errorf("no proxies found (checked %d istiods)", len(drs))
+				}
+
+				w = new(tabwriter.Writer).Init(s.Writer, 0, 8, 5, ' ', 0)
+				_, _ = fmt.Fprintln(w, "NAME\tCDS\tLDS\tEDS\tRDS\tISTIOD\tVERSION")
+
+				sort.Slice(fullStatus, func(i, j int) bool {
+					return fullStatus[i].proxyID < fullStatus[j].proxyID
+				})
+			default:
+				for _, resource := range dr.Resources {
+					if s.InternalDebugAllIstiod {
+						mappedResp[id] = string(resource.Value) + "\n"
+					} else {
+						_, _ = s.Writer.Write(resource.Value)
+						_, _ = s.Writer.Write([]byte("\n"))
+					}
+				}
+				fullStatus = nil
+			}
+		}
+	}
+	if len(mappedResp) > 0 {
+		mresp, err := json.MarshalIndent(mappedResp, "", "  ")
+		if err != nil {
+			return nil, nil, err
+		}
+		_, _ = s.Writer.Write(mresp)
+		_, _ = s.Writer.Write([]byte("\n"))
+	}
+
+	return w, fullStatus, nil
+}
+
+func xdsStatusPrintln(w io.Writer, status *xdsWriterStatus) error {
+	_, err := fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\t%v\n",
+		status.proxyID,
+		status.clusterStatus, status.listenerStatus, status.endpointStatus, status.routeStatus,
+		status.istiodID, status.istiodVersion)
+	return err
+}
+
+func getSyncStatus(clientConfig *xdsstatus.ClientConfig) (cds, lds, eds, rds string) {
+	configs := handleAndGetXdsConfigs(clientConfig)
+	for _, config := range configs {
+		cfgType := config.GetTypeUrl()
+		switch cfgType {
+		case xdsresource.ListenerType:
+			lds = config.GetConfigStatus().String()
+		case xdsresource.ClusterType:
+			cds = config.GetConfigStatus().String()
+		case xdsresource.RouteType:
+			rds = config.GetConfigStatus().String()
+		case xdsresource.EndpointType:
+			eds = config.GetConfigStatus().String()
+		default:
+			log.Infof("GenericXdsConfig unexpected type %s\n", xdsresource.GetShortType(cfgType))
+		}
+	}
+	return
+}
+
+func handleAndGetXdsConfigs(clientConfig *xdsstatus.ClientConfig) []*xdsstatus.ClientConfig_GenericXdsConfig {
+	configs := make([]*xdsstatus.ClientConfig_GenericXdsConfig, 0)
+	if clientConfig.GetGenericXdsConfigs() != nil {
+		configs = clientConfig.GetGenericXdsConfigs()
+		return configs
+	}
+
+	// FIXME: currently removing the deprecated code below may result in functions not working
+	// if there is a mismatch of versions between istiod and istioctl
+	// nolint: staticcheck
+	for _, config := range clientConfig.GetXdsConfig() {
+		var typeURL string
+		switch config.PerXdsConfig.(type) {
+		case *xdsstatus.PerXdsConfig_ListenerConfig:
+			typeURL = xdsresource.ListenerType
+		case *xdsstatus.PerXdsConfig_ClusterConfig:
+			typeURL = xdsresource.ClusterType
+		case *xdsstatus.PerXdsConfig_RouteConfig:
+			typeURL = xdsresource.RouteType
+		case *xdsstatus.PerXdsConfig_EndpointConfig:
+			typeURL = xdsresource.EndpointType
+		}
+
+		if typeURL != "" {
+			configs = append(configs, &xdsstatus.ClientConfig_GenericXdsConfig{
+				TypeUrl:      typeURL,
+				ConfigStatus: config.Status,
+			})
+		}
+	}
+	return configs
 }

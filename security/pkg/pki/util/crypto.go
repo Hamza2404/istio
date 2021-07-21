@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package util
 
 import (
 	"crypto"
+	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
@@ -24,8 +25,8 @@ import (
 )
 
 const (
-	blockTypeECParameters    = "EC PARAMETERS"
-	blockTypeRSAPrivateKey   = "RSA PRIVATE KEY" // PKCS#5 private key
+	blockTypeECPrivateKey    = "EC PRIVATE KEY"
+	blockTypeRSAPrivateKey   = "RSA PRIVATE KEY" // PKCS#1 private key
 	blockTypePKCS8PrivateKey = "PRIVATE KEY"     // PKCS#8 plain private key
 )
 
@@ -67,7 +68,7 @@ func ParsePemEncodedKey(keyBytes []byte) (crypto.PrivateKey, error) {
 	}
 
 	switch kb.Type {
-	case blockTypeECParameters:
+	case blockTypeECPrivateKey:
 		key, err := x509.ParseECPrivateKey(kb.Bytes)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse the ECDSA private key")
@@ -97,4 +98,15 @@ func GetRSAKeySize(privKey crypto.PrivateKey) (int, error) {
 	}
 	pkey := privKey.(*rsa.PrivateKey)
 	return pkey.N.BitLen(), nil
+}
+
+// IsSupportedECPrivateKey is a predicate returning true if the private key is EC based
+func IsSupportedECPrivateKey(privKey *crypto.PrivateKey) bool {
+	switch (*privKey).(type) {
+	// this should agree with var SupportedECSignatureAlgorithms
+	case *ecdsa.PrivateKey:
+		return true
+	default:
+		return false
+	}
 }

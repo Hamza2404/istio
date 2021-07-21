@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,11 +17,11 @@ package kube
 import (
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 )
 
 func TestStr2NamedPort(t *testing.T) {
-	var tests = []struct {
+	tests := []struct {
 		input  string    // input
 		expVal NamedPort // output
 		expErr bool      // error
@@ -42,7 +42,7 @@ func TestStr2NamedPort(t *testing.T) {
 		}
 		if tst.expErr {
 			if actErr == nil {
-				t.Errorf("Got no error when expecting an error for for Str2NamedPort('%s')", tst.input)
+				t.Errorf("Got no error when expecting an error for Str2NamedPort('%s')", tst.input)
 			}
 		} else {
 			if actErr != nil {
@@ -53,7 +53,7 @@ func TestStr2NamedPort(t *testing.T) {
 }
 
 func TestSplitEqual(t *testing.T) {
-	var tests = []struct {
+	tests := []struct {
 		input string // input
 		expK  string // output1
 		expV  string // output2
@@ -74,7 +74,7 @@ func TestSplitEqual(t *testing.T) {
 }
 
 func TestSamePorts(t *testing.T) {
-	var tests = []struct {
+	tests := []struct {
 		input1   []v1.EndpointPort
 		input2   map[int32]bool
 		expected bool // result

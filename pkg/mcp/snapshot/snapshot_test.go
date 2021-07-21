@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,127 +17,65 @@ package snapshot
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	"github.com/gogo/protobuf/proto"
-	"github.com/gogo/protobuf/types"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 
 	mcp "istio.io/api/mcp/v1alpha1"
-	"istio.io/istio/pkg/mcp/server"
+	"istio.io/istio/pkg/mcp/internal/test"
+	"istio.io/istio/pkg/mcp/source"
+	"istio.io/istio/pkg/mcp/testing/groups"
 )
-
-// fake protobuf types that implements required resource interface
-
-type fakeTypeBase struct{ Info string }
-
-func (f fakeTypeBase) Reset()                   {}
-func (f fakeTypeBase) String() string           { return f.Info }
-func (f fakeTypeBase) ProtoMessage()            {}
-func (f fakeTypeBase) Marshal() ([]byte, error) { return []byte(f.Info), nil }
-
-type fakeType0 struct{ fakeTypeBase }
-type fakeType1 struct{ fakeTypeBase }
-type fakeType2 struct{ fakeTypeBase }
-
-const (
-	typePrefix      = "type.googleapis.com/"
-	fakeType0Prefix = "istio.io.galley.pkg.mcp.server.fakeType0"
-	fakeType1Prefix = "istio.io.galley.pkg.mcp.server.fakeType1"
-	fakeType2Prefix = "istio.io.galley.pkg.mcp.server.fakeType2"
-
-	fakeType0TypeURL = typePrefix + fakeType0Prefix
-	fakeType1TypeURL = typePrefix + fakeType1Prefix
-	fakeType2TypeURL = typePrefix + fakeType2Prefix
-)
-
-func mustMarshalAny(pb proto.Message) *types.Any {
-	a, err := types.MarshalAny(pb)
-	if err != nil {
-		panic(err.Error())
-	}
-	return a
-}
-
-func init() {
-	proto.RegisterType((*fakeType0)(nil), fakeType0Prefix)
-	proto.RegisterType((*fakeType1)(nil), fakeType1Prefix)
-	proto.RegisterType((*fakeType2)(nil), fakeType2Prefix)
-
-	fakeEnvelope0 = &mcp.Envelope{
-		Metadata: &mcp.Metadata{Name: "f0"},
-		Resource: mustMarshalAny(&fakeType0{fakeTypeBase{"f0"}}),
-	}
-	fakeEnvelope1 = &mcp.Envelope{
-		Metadata: &mcp.Metadata{Name: "f1"},
-		Resource: mustMarshalAny(&fakeType1{fakeTypeBase{"f1"}}),
-	}
-	fakeEnvelope2 = &mcp.Envelope{
-		Metadata: &mcp.Metadata{Name: "f2"},
-		Resource: mustMarshalAny(&fakeType2{fakeTypeBase{"f2"}}),
-	}
-}
 
 type fakeSnapshot struct {
 	// read-only fields - no locking required
-	envelopes map[string][]*mcp.Envelope
+	resources map[string][]*mcp.Resource
 	versions  map[string]string
 }
 
-func (fs *fakeSnapshot) Resources(typ string) []*mcp.Envelope { return fs.envelopes[typ] }
-func (fs *fakeSnapshot) Version(typ string) string            { return fs.versions[typ] }
+func (fs *fakeSnapshot) Resources(collection string) []*mcp.Resource { return fs.resources[collection] }
+func (fs *fakeSnapshot) Version(collection string) string            { return fs.versions[collection] }
+func (fs *fakeSnapshot) Collections() []string {
+	result := make([]string, 0, len(fs.resources))
+	for collection := range fs.resources {
+		result = append(result, collection)
+	}
+
+	return result
+}
 
 func (fs *fakeSnapshot) copy() *fakeSnapshot {
 	fsCopy := &fakeSnapshot{
-		envelopes: make(map[string][]*mcp.Envelope),
+		resources: make(map[string][]*mcp.Resource),
 		versions:  make(map[string]string),
 	}
-	for typeURL, envelopes := range fs.envelopes {
-		fsCopy.envelopes[typeURL] = append(fsCopy.envelopes[typeURL], envelopes...)
-		fsCopy.versions[typeURL] = fs.versions[typeURL]
+	for collection, resources := range fs.resources {
+		fsCopy.resources[collection] = append(fsCopy.resources[collection], resources...)
+		fsCopy.versions[collection] = fs.versions[collection]
 	}
 	return fsCopy
 }
 
 func makeSnapshot(version string) *fakeSnapshot {
 	return &fakeSnapshot{
-		envelopes: map[string][]*mcp.Envelope{
-			fakeType0TypeURL: {fakeEnvelope0},
-			fakeType1TypeURL: {fakeEnvelope1},
-			fakeType2TypeURL: {fakeEnvelope2},
+		resources: map[string][]*mcp.Resource{
+			test.FakeType0Collection: {test.Type0A[0].Resource},
+			test.FakeType1Collection: {test.Type1A[0].Resource},
+			test.FakeType2Collection: {test.Type2A[0].Resource},
 		},
 		versions: map[string]string{
-			fakeType0TypeURL: version,
-			fakeType1TypeURL: version,
-			fakeType2TypeURL: version,
+			test.FakeType0Collection: version,
+			test.FakeType1Collection: version,
+			test.FakeType2Collection: version,
 		},
 	}
 }
 
 var _ Snapshot = &fakeSnapshot{}
-
-var (
-	node = &core.Node{
-		Id:      "test-id",
-		Cluster: "test-cluster",
-	}
-
-	key = node.Id
-
-	fakeEnvelope0 *mcp.Envelope
-	fakeEnvelope1 *mcp.Envelope
-	fakeEnvelope2 *mcp.Envelope
-
-	WatchResponseTypes = []string{
-		fakeType0TypeURL,
-		fakeType1TypeURL,
-		fakeType2TypeURL,
-	}
-)
 
 // TODO - refactor tests to not rely on sleeps
 var (
@@ -147,40 +85,51 @@ var (
 func nextStrVersion(version *int64) string {
 	v := atomic.AddInt64(version, 1)
 	return strconv.FormatInt(v, 10)
-
 }
 
-func createTestWatch(c *Cache, typeURL, version string, responseC chan *server.WatchResponse, wantResponse, wantCancel bool) (*server.WatchResponse, server.CancelWatchFunc, error) { // nolint: lll
-	req := &mcp.MeshConfigRequest{
-		TypeUrl:     typeURL,
+// nolint: unparam
+func createTestWatch(c source.Watcher, collection, version string, responseC chan *source.WatchResponse, wantResponse, wantCancel bool) (*source.WatchResponse, source.CancelWatchFunc, error) { // nolint: lll
+	req := &source.Request{
+		Collection:  collection,
 		VersionInfo: version,
-		Client: &mcp.Client{
-			Id: key,
-		},
+		SinkNode:    test.Node,
 	}
-	got, cancel := c.Watch(req, responseC)
+
+	cancel := c.Watch(req, func(response *source.WatchResponse) {
+		responseC <- response
+	}, "192.168.1.1:1234")
+
 	if wantResponse {
-		if got == nil {
+		select {
+		case got := <-responseC:
+			return got, nil, nil
+		default:
 			return nil, nil, errors.New("wanted response, got none")
 		}
 	} else {
-		if got != nil {
-			return nil, nil, fmt.Errorf("wanted no response, got %v", got)
+		select {
+		case got := <-responseC:
+			if got != nil {
+				return nil, nil, fmt.Errorf("wanted no response, got %v", got)
+			}
+		default:
 		}
 	}
+
 	if wantCancel {
 		if cancel == nil {
 			return nil, nil, errors.New("wanted cancel() function, got none")
 		}
 	} else {
 		if cancel != nil {
-			return nil, nil, fmt.Errorf("wanted no cancel() function, got %v", cancel)
+			return nil, nil, fmt.Errorf("wanted no cancel() function, got %p", cancel)
 		}
 	}
-	return got, cancel, nil
+
+	return nil, cancel, nil
 }
 
-func getAsyncResponse(responseC chan *server.WatchResponse) (*server.WatchResponse, bool) {
+func getAsyncResponse(responseC chan *source.WatchResponse) (*source.WatchResponse, bool) {
 	select {
 	case got, more := <-responseC:
 		if !more {
@@ -197,49 +146,57 @@ func TestCreateWatch(t *testing.T) {
 	initVersion := nextStrVersion(&versionInt)
 	snapshot := makeSnapshot(initVersion)
 
-	c := New()
-	c.SetSnapshot(key, snapshot)
+	c := New(groups.DefaultIndexFn)
+	c.SetSnapshot(groups.Default, snapshot)
 
 	// verify immediate and async responses are handled independently across types.
-	for _, typeURL := range WatchResponseTypes {
-		t.Run(typeURL, func(t *testing.T) {
-			typeVersion := initVersion
-			responseC := make(chan *server.WatchResponse, 1)
+
+	for _, collection := range test.SupportedCollections {
+		t.Run(collection, func(t *testing.T) {
+			collectionVersion := initVersion
+			responseC := make(chan *source.WatchResponse, 1)
 
 			// verify immediate response
-			if _, _, err := createTestWatch(c, typeURL, "", responseC, true, false); err != nil {
+			if _, _, err := createTestWatch(c, collection, "", responseC, true, false); err != nil {
 				t.Fatalf("CreateWatch() failed: %v", err)
 			}
 
 			// verify open watch, i.e. no immediate or async response
-			if _, _, err := createTestWatch(c, typeURL, typeVersion, responseC, false, true); err != nil {
+			if _, _, err := createTestWatch(c, collection, collectionVersion, responseC, false, true); err != nil {
 				t.Fatalf("CreateWatch() failed: %v", err)
 			}
+
 			if gotResponse, _ := getAsyncResponse(responseC); gotResponse != nil {
 				t.Fatalf("open watch failed: received premature response: %v", gotResponse)
 			}
 
 			// verify async response
 			snapshot = snapshot.copy()
-			typeVersion = nextStrVersion(&versionInt)
-			snapshot.versions[typeURL] = typeVersion
-			c.SetSnapshot(key, snapshot)
+			watchVersion := collectionVersion
+			collectionVersion = nextStrVersion(&versionInt)
+			snapshot.versions[collection] = collectionVersion
+			c.SetSnapshot(groups.Default, snapshot)
 
 			if gotResponse, _ := getAsyncResponse(responseC); gotResponse != nil {
-				wantResponse := &server.WatchResponse{
-					TypeURL:   typeURL,
-					Version:   typeVersion,
-					Envelopes: snapshot.Resources(typeURL),
+				wantResponse := &source.WatchResponse{
+					Collection: collection,
+					Version:    collectionVersion,
+					Resources:  snapshot.Resources(collection),
+					Request: &source.Request{
+						Collection:  collection,
+						SinkNode:    test.Node,
+						VersionInfo: watchVersion,
+					},
 				}
-				if !reflect.DeepEqual(gotResponse, wantResponse) {
-					t.Fatalf("received bad WatchResponse: got %v wantResponse %v", gotResponse, wantResponse)
+				if diff := cmp.Diff(gotResponse, wantResponse, cmpopts.IgnoreUnexported(source.Request{})); diff != "" {
+					t.Fatalf("received bad WatchResponse: \n got %v \nwant %v \ndiff %v", gotResponse, wantResponse, diff)
 				}
 			} else {
 				t.Fatalf("watch response channel did not produce response after %v", asyncResponseTimeout)
 			}
 
 			// verify lack of immediate response after async response.
-			if _, _, err := createTestWatch(c, typeURL, typeVersion, responseC, false, true); err != nil {
+			if _, _, err := createTestWatch(c, collection, collectionVersion, responseC, false, true); err != nil {
 				t.Fatalf("CreateWatch() failed after receiving prior response: %v", err)
 			}
 
@@ -255,21 +212,21 @@ func TestWatchCancel(t *testing.T) {
 	initVersion := nextStrVersion(&versionInt)
 	snapshot := makeSnapshot(initVersion)
 
-	c := New()
-	c.SetSnapshot(key, snapshot)
+	c := New(groups.DefaultIndexFn)
+	c.SetSnapshot(groups.Default, snapshot)
 
-	for _, typeURL := range WatchResponseTypes {
-		t.Run(typeURL, func(t *testing.T) {
-			typeVersion := initVersion
-			responseC := make(chan *server.WatchResponse, 1)
+	for _, collection := range test.SupportedCollections {
+		t.Run(collection, func(t *testing.T) {
+			collectionVersion := initVersion
+			responseC := make(chan *source.WatchResponse, 1)
 
 			// verify immediate response
-			if _, _, err := createTestWatch(c, typeURL, "", responseC, true, false); err != nil {
+			if _, _, err := createTestWatch(c, collection, "", responseC, true, false); err != nil {
 				t.Fatalf("CreateWatch failed: immediate response not received: %v", err)
 			}
 
 			// verify watch can be canceled
-			_, cancel, err := createTestWatch(c, typeURL, typeVersion, responseC, false, true)
+			_, cancel, err := createTestWatch(c, collection, collectionVersion, responseC, false, true)
 			if err != nil {
 				t.Fatalf("CreateWatche failed: %v", err)
 			}
@@ -277,9 +234,9 @@ func TestWatchCancel(t *testing.T) {
 
 			// verify no response after watch is canceled
 			snapshot = snapshot.copy()
-			typeVersion = nextStrVersion(&versionInt)
-			snapshot.versions[typeURL] = typeVersion
-			c.SetSnapshot(key, snapshot)
+			collectionVersion = nextStrVersion(&versionInt)
+			snapshot.versions[collection] = collectionVersion
+			c.SetSnapshot(groups.Default, snapshot)
 
 			if gotResponse, _ := getAsyncResponse(responseC); gotResponse != nil {
 				t.Fatalf("open watch failed: received premature response: %v", gotResponse)
@@ -293,33 +250,37 @@ func TestClearSnapshot(t *testing.T) {
 	initVersion := nextStrVersion(&versionInt)
 	snapshot := makeSnapshot(initVersion)
 
-	c := New()
-	c.SetSnapshot(key, snapshot)
+	c := New(groups.DefaultIndexFn)
+	c.SetSnapshot(groups.Default, snapshot)
 
-	for _, typeURL := range WatchResponseTypes {
-		t.Run(typeURL, func(t *testing.T) {
-			responseC := make(chan *server.WatchResponse, 1)
+	for _, collection := range test.SupportedCollections {
+		t.Run(collection, func(t *testing.T) {
+			responseC := make(chan *source.WatchResponse, 1)
 
 			// verify no immediate response if snapshot is cleared.
-			c.ClearSnapshot(key)
-			if _, _, err := createTestWatch(c, typeURL, "", responseC, false, true); err != nil {
+			c.ClearSnapshot(groups.Default)
+			if _, _, err := createTestWatch(c, collection, "", responseC, false, true); err != nil {
 				t.Fatalf("CreateWatch() failed: %v", err)
 			}
 
 			// verify async response after new snapshot is added
 			snapshot = snapshot.copy()
 			typeVersion := nextStrVersion(&versionInt)
-			snapshot.versions[typeURL] = typeVersion
-			c.SetSnapshot(key, snapshot)
+			snapshot.versions[collection] = typeVersion
+			c.SetSnapshot(groups.Default, snapshot)
 
 			if gotResponse, _ := getAsyncResponse(responseC); gotResponse != nil {
-				wantResponse := &server.WatchResponse{
-					TypeURL:   typeURL,
-					Version:   typeVersion,
-					Envelopes: snapshot.Resources(typeURL),
+				wantResponse := &source.WatchResponse{
+					Collection: collection,
+					Version:    typeVersion,
+					Resources:  snapshot.Resources(collection),
+					Request: &source.Request{
+						Collection: collection,
+						SinkNode:   test.Node,
+					},
 				}
-				if !reflect.DeepEqual(gotResponse, wantResponse) {
-					t.Fatalf("received bad WatchResponse: got %v wantResponse %v", gotResponse, wantResponse)
+				if diff := cmp.Diff(gotResponse, wantResponse, cmpopts.IgnoreUnexported(source.Request{})); diff != "" {
+					t.Fatalf("received bad WatchResponse: \n got %v \nwant %+v \ndiff %v", gotResponse, wantResponse, diff)
 				}
 			} else {
 				t.Fatalf("watch response channel did not produce response after %v", asyncResponseTimeout)
@@ -333,28 +294,28 @@ func TestClearStatus(t *testing.T) {
 	initVersion := nextStrVersion(&versionInt)
 	snapshot := makeSnapshot(initVersion)
 
-	c := New()
+	c := New(groups.DefaultIndexFn)
 
-	for _, typeURL := range WatchResponseTypes {
-		t.Run(typeURL, func(t *testing.T) {
-			responseC := make(chan *server.WatchResponse, 1)
+	for _, collection := range test.SupportedCollections {
+		t.Run(collection, func(t *testing.T) {
+			responseC := make(chan *source.WatchResponse, 1)
 
-			if _, _, err := createTestWatch(c, typeURL, "", responseC, false, true); err != nil {
+			if _, _, err := createTestWatch(c, collection, "", responseC, false, true); err != nil {
 				t.Fatalf("CreateWatch() failed: %v", err)
 			}
 
-			if status := c.Status(key); status == nil {
+			if status := c.Status(groups.Default); status == nil {
 				t.Fatal("no status found")
 			}
 
-			c.ClearStatus(key)
+			c.ClearStatus(groups.Default)
 
 			// verify that ClearStatus() cancels the open watch and
 			// that any subsequent snapshot is not delivered.
 			snapshot = snapshot.copy()
 			typeVersion := nextStrVersion(&versionInt)
-			snapshot.versions[typeURL] = typeVersion
-			c.SetSnapshot(key, snapshot)
+			snapshot.versions[collection] = typeVersion
+			c.SetSnapshot(groups.Default, snapshot)
 
 			if gotResponse, timeout := getAsyncResponse(responseC); gotResponse != nil {
 				t.Fatalf("open watch failed: received unexpected response: %v", gotResponse)
@@ -362,7 +323,7 @@ func TestClearStatus(t *testing.T) {
 				t.Fatal("open watch was not canceled on ClearStatus()")
 			}
 
-			c.ClearSnapshot(key)
+			c.ClearSnapshot(groups.Default)
 		})
 	}
 }

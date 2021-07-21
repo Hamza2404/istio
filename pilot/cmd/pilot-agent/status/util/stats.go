@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,42 +19,103 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/hashicorp/go-multierror"
+	multierror "github.com/hashicorp/go-multierror"
 )
 
 const (
-	statCdsUpdates = "cluster_manager.cds.update_success"
-	statLdsUpdates = "listener_manager.lds.update_success"
+	statCdsRejected    = "cluster_manager.cds.update_rejected"
+	statsCdsSuccess    = "cluster_manager.cds.update_success"
+	statLdsRejected    = "listener_manager.lds.update_rejected"
+	statLdsSuccess     = "listener_manager.lds.update_success"
+	statServerState    = "server.state"
+	statWorkersStarted = "listener_manager.workers_started"
+	readyStatsRegex    = "^(server\\.state|listener_manager\\.workers_started)"
+	updateStatsRegex   = "^(cluster_manager\\.cds|listener_manager\\.lds)\\.(update_success|update_rejected)$"
 )
+
+var readinessTimeout = time.Second * 3 // Default Readiness timeout. It is set the same in helm charts.
+
+type stat struct {
+	name  string
+	value *uint64
+	found bool
+}
 
 // Stats contains values of interest from a poll of Envoy stats.
 type Stats struct {
-	CDSUpdates uint64
-	LDSUpdates uint64
+	// Update Stats.
+	CDSUpdatesSuccess   uint64
+	CDSUpdatesRejection uint64
+	LDSUpdatesSuccess   uint64
+	LDSUpdatesRejection uint64
+	// Server State of Envoy.
+	ServerState    uint64
+	WorkersStarted uint64
 }
 
 // String representation of the Stats.
 func (s *Stats) String() string {
-	return fmt.Sprintf("cds updates: %d, lds updates: %d",
-		s.CDSUpdates,
-		s.LDSUpdates)
+	return fmt.Sprintf("cds updates: %d successful, %d rejected; lds updates: %d successful, %d rejected",
+		s.CDSUpdatesSuccess,
+		s.CDSUpdatesRejection,
+		s.LDSUpdatesSuccess,
+		s.LDSUpdatesRejection)
 }
 
-// GetStats from Envoy.
-func GetStats(adminPort uint16) (*Stats, error) {
-	input, err := doHTTPGet(fmt.Sprintf("http://127.0.0.1:%d/stats?usedonly", adminPort))
-	if err != nil {
-		return nil, multierror.Prefix(err, "failed retrieving Envoy stats:")
+// GetReadinessStats returns the current Envoy state by checking the "server.state" stat.
+func GetReadinessStats(localHostAddr string, adminPort uint16) (*uint64, bool, error) {
+	// If the localHostAddr was not set, we use 'localhost' to void empty host in URL.
+	if localHostAddr == "" {
+		localHostAddr = "localhost"
 	}
 
-	// Parse the Envoy stats.
+	readinessURL := fmt.Sprintf("http://%s:%d/stats?usedonly&filter=%s", localHostAddr, adminPort, readyStatsRegex)
+	stats, err := doHTTPGetWithTimeout(readinessURL, readinessTimeout)
+	if err != nil {
+		return nil, false, err
+	}
+	if !strings.Contains(stats.String(), "server.state") {
+		return nil, false, fmt.Errorf("server.state is not yet updated: %s", stats.String())
+	}
+
+	if !strings.Contains(stats.String(), "listener_manager.workers_started") {
+		return nil, false, fmt.Errorf("listener_manager.workers_started is not yet updated: %s", stats.String())
+	}
+
 	s := &Stats{}
 	allStats := []*stat{
-		{name: statCdsUpdates, value: &s.CDSUpdates},
-		{name: statLdsUpdates, value: &s.LDSUpdates},
+		{name: statServerState, value: &s.ServerState},
+		{name: statWorkersStarted, value: &s.WorkersStarted},
 	}
-	if err := parseStats(input, allStats); err != nil {
+	if err := parseStats(stats, allStats); err != nil {
+		return nil, false, err
+	}
+
+	return &s.ServerState, s.WorkersStarted == 1, nil
+}
+
+// GetUpdateStatusStats returns the version stats for CDS and LDS.
+func GetUpdateStatusStats(localHostAddr string, adminPort uint16) (*Stats, error) {
+	// If the localHostAddr was not set, we use 'localhost' to void empty host in URL.
+	if localHostAddr == "" {
+		localHostAddr = "localhost"
+	}
+
+	stats, err := doHTTPGet(fmt.Sprintf("http://%s:%d/stats?usedonly&filter=%s", localHostAddr, adminPort, updateStatsRegex))
+	if err != nil {
+		return nil, err
+	}
+
+	s := &Stats{}
+	allStats := []*stat{
+		{name: statsCdsSuccess, value: &s.CDSUpdatesSuccess},
+		{name: statCdsRejected, value: &s.CDSUpdatesRejection},
+		{name: statLdsSuccess, value: &s.LDSUpdatesSuccess},
+		{name: statLdsRejected, value: &s.LDSUpdatesRejection},
+	}
+	if err := parseStats(stats, allStats); err != nil {
 		return nil, err
 	}
 
@@ -72,16 +133,10 @@ func parseStats(input *bytes.Buffer, stats []*stat) (err error) {
 	}
 	for _, stat := range stats {
 		if !stat.found {
-			err = multierror.Append(err, fmt.Errorf("envoy stat missing: %s", stat.name))
+			*stat.value = 0
 		}
 	}
 	return
-}
-
-type stat struct {
-	name  string
-	value *uint64
-	found bool
 }
 
 func (s *stat) processLine(line string) error {

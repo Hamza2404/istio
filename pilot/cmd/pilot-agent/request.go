@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,24 +15,31 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"istio.io/istio/pilot/pkg/request"
-	"istio.io/istio/pkg/cmd"
 )
 
+var debugRequestPort int32 = 15000
+
+// NB: extra standard output in addition to what's returned from envoy
+// must not be added in this command. Otherwise, it'd break istioctl proxy-config,
+// which interprets the output literally as json document.
 var (
 	requestCmd = &cobra.Command{
 		Use:   "request <method> <path> [<body>]",
 		Short: "Makes an HTTP request to the Envoy admin API",
 		Args:  cobra.MinimumNArgs(2),
 		RunE: func(c *cobra.Command, args []string) error {
-			cmd.PrintFlags(c.Flags())
 			command := &request.Command{
-				Address: "127.0.0.1:15000",
-				Client:  &http.Client{},
+				Address: fmt.Sprintf("localhost:%d", debugRequestPort),
+				Client: &http.Client{
+					Timeout: 60 * time.Second,
+				},
 			}
 			body := ""
 			if len(args) >= 3 {
@@ -45,4 +52,6 @@ var (
 
 func init() {
 	rootCmd.AddCommand(requestCmd)
+	requestCmd.PersistentFlags().Int32Var(&debugRequestPort, "debug-port", debugRequestPort,
+		"Set the port to make a local request to. The default points to the Envoy admin API.")
 }

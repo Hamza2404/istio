@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Copyright 2018 Istio Authors. All Rights Reserved.
+# Copyright 2018 Istio Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 # Compare 2 multi document kubernetes yaml files
 # It ensures that order does not matter
 #
+from __future__ import print_function
 import argparse
 import datadiff
 import sys
@@ -25,7 +26,7 @@ import yaml  # pyyaml
 # returns fully qualified resource name of the k8s resource
 
 
-def byResourceName(res):
+def by_resource_name(res):
     if res is None:
         return ""
 
@@ -63,7 +64,7 @@ def normalize_configmap(res):
                 op = yaml.safe_load_all(data[k])
                 data[k] = list(op)
             except yaml.YAMLError as ex:
-                print ex
+                print(ex)
 
         return res
     except KeyError as ke:
@@ -117,8 +118,8 @@ def compare(args):
     j0 = normalize(list(yaml.safe_load_all(open(args.orig))), args)
     j1 = normalize(list(yaml.safe_load_all(open(args.new))), args)
 
-    q0 = {byResourceName(res): res for res in j0 if res is not None}
-    q1 = {byResourceName(res): res for res in j1 if res is not None}
+    q0 = {by_resource_name(res): res for res in j0 if res is not None}
+    q1 = {by_resource_name(res): res for res in j1 if res is not None}
 
     added, removed, common = keydiff(q0.keys(), q1.keys())
 
@@ -127,28 +128,28 @@ def compare(args):
         if q0[k] != q1[k]:
             changed += 1
 
-    print "## +++ ", args.new
-    print "## --- ", args.orig
-    print "## Added:", len(added)
-    print "## Removed:", len(removed)
-    print "## Updated:", changed
-    print "## Unchanged:", len(common) - changed
+    print("## +++ ", args.new)
+    print("## --- ", args.orig)
+    print("## Added:", len(added))
+    print("## Removed:", len(removed))
+    print("## Updated:", changed)
+    print("## Unchanged:", len(common) - changed)
 
     for k in sorted(added):
-        print "+", k
+        print("+", k)
 
     for k in sorted(removed):
-        print "-", k
+        print("-", k)
 
-    print "## *************************"
+    print("##", "*" * 25)
 
     for k in sorted(common):
         if q0[k] != q1[k]:
-            print "## ", k
+            print("## ", k)
             s0 = yaml.safe_dump(q0[k], default_flow_style=False, indent=2)
             s1 = yaml.safe_dump(q1[k], default_flow_style=False, indent=2)
 
-            print datadiff.diff(s0, s1, fromfile=args.orig, tofile=args.new)
+            print(datadiff.diff(s0, s1, fromfile=args.orig, tofile=args.new))
 
     return changed + len(added) + len(removed)
 

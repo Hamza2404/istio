@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors.
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,38 +20,53 @@ import (
 	"io/ioutil"
 	"testing"
 
+	envoycorev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	xdsapi "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	status "github.com/envoyproxy/go-control-plane/envoy/service/status/v3"
+	"github.com/golang/protobuf/ptypes/any"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 
-	"istio.io/istio/pilot/pkg/proxy/envoy/v2"
+	networkingutil "istio.io/istio/pilot/pkg/networking/util"
+	"istio.io/istio/pilot/pkg/xds"
+	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/tests/util"
+	istioversion "istio.io/pkg/version"
 )
+
+var preDefinedNonce = newNonce()
+
+func newNonce() string {
+	return uuid.New().String()
+}
 
 func TestStatusWriter_PrintAll(t *testing.T) {
 	tests := []struct {
 		name    string
-		input   map[string][]v2.SyncStatus
+		input   map[string][]xds.SyncStatus
 		want    string
 		wantErr bool
 	}{
 		{
-			name: "prints multiple pilot inputs to buffer in alphabetical order by pod name",
-			input: map[string][]v2.SyncStatus{
-				"pilot1": statusInput1(),
-				"pilot2": statusInput2(),
+			name: "prints multiple istiod inputs to buffer in alphabetical order by pod name",
+			input: map[string][]xds.SyncStatus{
+				"istiod1": statusInput1(),
+				"istiod2": statusInput2(),
+				"istiod3": statusInput3(),
 			},
 			want: "testdata/multiStatusMultiPilot.txt",
 		},
 		{
-			name: "prints single pilot input to buffer in alphabetical order by pod name",
-			input: map[string][]v2.SyncStatus{
-				"pilot1": append(statusInput1(), statusInput2()...),
+			name: "prints single istiod input to buffer in alphabetical order by pod name",
+			input: map[string][]xds.SyncStatus{
+				"istiod1": append(statusInput1(), statusInput2()...),
 			},
 			want: "testdata/multiStatusSinglePilot.txt",
 		},
 		{
 			name: "error if given non-syncstatus info",
-			input: map[string][]v2.SyncStatus{
-				"pilot1": {},
+			input: map[string][]xds.SyncStatus{
+				"istiod1": {},
 			},
 			wantErr: true,
 		},
@@ -65,9 +80,9 @@ func TestStatusWriter_PrintAll(t *testing.T) {
 				b, _ := json.Marshal(ss)
 				input[key] = b
 			}
-			if len(tt.input["pilot1"]) == 0 {
+			if len(tt.input["istiod1"]) == 0 {
 				input = map[string][]byte{
-					"pilot1": []byte(`gobbledygook`),
+					"istiod1": []byte(`gobbledygook`),
 				}
 			}
 			err := sw.PrintAll(input)
@@ -87,32 +102,40 @@ func TestStatusWriter_PrintAll(t *testing.T) {
 func TestStatusWriter_PrintSingle(t *testing.T) {
 	tests := []struct {
 		name      string
-		input     map[string][]v2.SyncStatus
+		input     map[string][]xds.SyncStatus
 		filterPod string
 		want      string
 		wantErr   bool
 	}{
 		{
-			name: "prints multiple pilot inputs to buffer filtering for pod",
-			input: map[string][]v2.SyncStatus{
-				"pilot1": statusInput1(),
-				"pilot2": statusInput2(),
+			name: "prints multiple istiod inputs to buffer filtering for pod",
+			input: map[string][]xds.SyncStatus{
+				"istiod1": statusInput1(),
+				"istiod2": statusInput2(),
 			},
 			filterPod: "proxy2",
 			want:      "testdata/singleStatus.txt",
 		},
 		{
-			name: "single pilot input to buffer filtering for pod",
-			input: map[string][]v2.SyncStatus{
-				"pilot2": append(statusInput1(), statusInput2()...),
+			name: "single istiod input to buffer filtering for pod",
+			input: map[string][]xds.SyncStatus{
+				"istiod2": append(statusInput1(), statusInput2()...),
 			},
 			filterPod: "proxy2",
 			want:      "testdata/singleStatus.txt",
+		},
+		{
+			name: "fallback to proxy version",
+			input: map[string][]xds.SyncStatus{
+				"istiod2": statusInputProxyVersion(),
+			},
+			filterPod: "proxy2",
+			want:      "testdata/singleStatusFallback.txt",
 		},
 		{
 			name: "error if given non-syncstatus info",
-			input: map[string][]v2.SyncStatus{
-				"pilot1": {},
+			input: map[string][]xds.SyncStatus{
+				"istiod1": {},
 			},
 			wantErr: true,
 		},
@@ -126,9 +149,9 @@ func TestStatusWriter_PrintSingle(t *testing.T) {
 				b, _ := json.Marshal(ss)
 				input[key] = b
 			}
-			if len(tt.input["pilot1"]) == 0 && len(tt.input["pilot2"]) == 0 {
+			if len(tt.input["istiod1"]) == 0 && len(tt.input["istiod2"]) == 0 {
 				input = map[string][]byte{
-					"pilot1": []byte(`gobbledygook`),
+					"istiod1": []byte(`gobbledygook`),
 				}
 			}
 			err := sw.PrintSingle(input, tt.filterPod)
@@ -145,35 +168,215 @@ func TestStatusWriter_PrintSingle(t *testing.T) {
 	}
 }
 
-func statusInput1() []v2.SyncStatus {
-	return []v2.SyncStatus{
+func statusInput1() []xds.SyncStatus {
+	return []xds.SyncStatus{
 		{
-			ProxyID:         "proxy1",
-			ProxyVersion:    "1.0",
-			ClusterSent:     "2009-11-10 23:00:00 +0000 UTC m=+0.000000001",
-			ClusterAcked:    "2009-11-10 22:00:00 +0000 UTC m=+0.000000001",
-			ListenerSent:    "2009-11-10 23:00:00 +0000 UTC m=+0.000000001",
-			ListenerAcked:   "2009-11-10 23:00:00 +0000 UTC m=+0.000000001",
-			EndpointSent:    "2009-11-10 23:00:00 +0000 UTC m=+0.000000001",
-			EndpointAcked:   "2009-11-10 23:00:00 +0000 UTC m=+0.000000001",
-			EndpointPercent: 100,
+			ProxyID:       "proxy1",
+			IstioVersion:  "1.1",
+			ClusterSent:   preDefinedNonce,
+			ClusterAcked:  newNonce(),
+			ListenerSent:  preDefinedNonce,
+			ListenerAcked: preDefinedNonce,
+			EndpointSent:  preDefinedNonce,
+			EndpointAcked: preDefinedNonce,
 		},
 	}
 }
 
-func statusInput2() []v2.SyncStatus {
-	return []v2.SyncStatus{
+func statusInput2() []xds.SyncStatus {
+	return []xds.SyncStatus{
 		{
 			ProxyID:       "proxy2",
-			ProxyVersion:  "1.0",
-			ClusterSent:   "2009-11-10 23:00:00 +0000 UTC m=+0.000000001",
-			ClusterAcked:  "2009-11-10 22:00:00 +0000 UTC m=+0.000000001",
-			ListenerSent:  "2009-11-10 23:00:00 +0000 UTC m=+0.000000001",
-			ListenerAcked: "2009-11-10 23:00:00 +0000 UTC m=+0.000000001",
-			EndpointSent:  "2009-11-10 23:00:00 +0000 UTC m=+0.000000001",
-			EndpointAcked: "2009-11-10 22:00:00 +0000 UTC m=+0.000000001",
-			RouteSent:     "2009-11-10 23:00:00 +0000 UTC m=+0.000000001",
-			RouteAcked:    "2009-11-10 23:00:00 +0000 UTC m=+0.000000001",
+			IstioVersion:  "1.1",
+			ClusterSent:   preDefinedNonce,
+			ClusterAcked:  newNonce(),
+			ListenerSent:  preDefinedNonce,
+			ListenerAcked: preDefinedNonce,
+			EndpointSent:  preDefinedNonce,
+			EndpointAcked: newNonce(),
+			RouteSent:     preDefinedNonce,
+			RouteAcked:    preDefinedNonce,
+		},
+	}
+}
+
+func statusInput3() []xds.SyncStatus {
+	return []xds.SyncStatus{
+		{
+			ProxyID:       "proxy3",
+			IstioVersion:  "1.1",
+			ClusterSent:   preDefinedNonce,
+			ClusterAcked:  "",
+			ListenerAcked: preDefinedNonce,
+			EndpointSent:  preDefinedNonce,
+			EndpointAcked: "",
+			RouteSent:     preDefinedNonce,
+			RouteAcked:    preDefinedNonce,
+		},
+	}
+}
+
+func statusInputProxyVersion() []xds.SyncStatus {
+	return []xds.SyncStatus{
+		{
+			ProxyID:       "proxy2",
+			ProxyVersion:  "1.1",
+			ClusterSent:   preDefinedNonce,
+			ClusterAcked:  newNonce(),
+			ListenerSent:  preDefinedNonce,
+			ListenerAcked: preDefinedNonce,
+			EndpointSent:  preDefinedNonce,
+			EndpointAcked: newNonce(),
+			RouteSent:     preDefinedNonce,
+			RouteAcked:    preDefinedNonce,
+		},
+	}
+}
+
+func TestXdsStatusWriter_PrintAll(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   map[string]*xdsapi.DiscoveryResponse
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "prints multiple istiod inputs to buffer in alphabetical order by pod name",
+			input: map[string]*xdsapi.DiscoveryResponse{
+				"istiod1": xdsResponseInput("istiod1", []clientConfigInput{
+					{
+						proxyID:       "proxy1",
+						cdsSyncStatus: status.ConfigStatus_STALE,
+						ldsSyncStatus: status.ConfigStatus_SYNCED,
+						rdsSyncStatus: status.ConfigStatus_NOT_SENT,
+						edsSyncStatus: status.ConfigStatus_SYNCED,
+					},
+				}),
+				"istiod2": xdsResponseInput("istiod2", []clientConfigInput{
+					{
+						proxyID:       "proxy2",
+						cdsSyncStatus: status.ConfigStatus_STALE,
+						ldsSyncStatus: status.ConfigStatus_SYNCED,
+						rdsSyncStatus: status.ConfigStatus_SYNCED,
+						edsSyncStatus: status.ConfigStatus_STALE,
+					},
+				}),
+				"istiod3": xdsResponseInput("istiod3", []clientConfigInput{
+					{
+						proxyID:       "proxy3",
+						cdsSyncStatus: status.ConfigStatus_UNKNOWN,
+						ldsSyncStatus: status.ConfigStatus_ERROR,
+						rdsSyncStatus: status.ConfigStatus_NOT_SENT,
+						edsSyncStatus: status.ConfigStatus_STALE,
+					},
+				}),
+			},
+			want: "testdata/multiXdsStatusMultiPilot.txt",
+		},
+		{
+			name: "prints single istiod input to buffer in alphabetical order by pod name",
+			input: map[string]*xdsapi.DiscoveryResponse{
+				"istiod1": xdsResponseInput("istiod1", []clientConfigInput{
+					{
+						proxyID:       "proxy1",
+						cdsSyncStatus: status.ConfigStatus_STALE,
+						ldsSyncStatus: status.ConfigStatus_SYNCED,
+						rdsSyncStatus: status.ConfigStatus_NOT_SENT,
+						edsSyncStatus: status.ConfigStatus_SYNCED,
+					},
+					{
+						proxyID:       "proxy2",
+						cdsSyncStatus: status.ConfigStatus_STALE,
+						ldsSyncStatus: status.ConfigStatus_SYNCED,
+						rdsSyncStatus: status.ConfigStatus_SYNCED,
+						edsSyncStatus: status.ConfigStatus_STALE,
+					},
+				}),
+			},
+			want: "testdata/multiXdsStatusSinglePilot.txt",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := &bytes.Buffer{}
+			sw := XdsStatusWriter{Writer: got}
+			input := map[string]*xdsapi.DiscoveryResponse{}
+			for key, ss := range tt.input {
+				input[key] = ss
+			}
+
+			err := sw.PrintAll(input)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			want, _ := ioutil.ReadFile(tt.want)
+			if err := util.Compare(got.Bytes(), want); err != nil {
+				t.Errorf(err.Error())
+			}
+		})
+	}
+}
+
+const clientConfigType = "type.googleapis.com/envoy.service.status.v3.ClientConfig"
+
+type clientConfigInput struct {
+	proxyID string
+
+	cdsSyncStatus status.ConfigStatus
+	ldsSyncStatus status.ConfigStatus
+	rdsSyncStatus status.ConfigStatus
+	edsSyncStatus status.ConfigStatus
+}
+
+func newXdsClientConfig(config clientConfigInput) *status.ClientConfig {
+	return &status.ClientConfig{
+		Node: &envoycorev3.Node{
+			Id: config.proxyID,
+		},
+		GenericXdsConfigs: []*status.ClientConfig_GenericXdsConfig{
+			{
+				TypeUrl:      v3.ClusterType,
+				ConfigStatus: config.cdsSyncStatus,
+			},
+			{
+				TypeUrl:      v3.ListenerType,
+				ConfigStatus: config.ldsSyncStatus,
+			},
+			{
+				TypeUrl:      v3.RouteType,
+				ConfigStatus: config.rdsSyncStatus,
+			},
+			{
+				TypeUrl:      v3.EndpointType,
+				ConfigStatus: config.edsSyncStatus,
+			},
+		},
+	}
+}
+
+func xdsResponseInput(istiodID string, configInputs []clientConfigInput) *xdsapi.DiscoveryResponse {
+	icp := &xds.IstioControlPlaneInstance{
+		Component: "istiod",
+		ID:        istiodID,
+		Info: istioversion.BuildInfo{
+			Version: "1.1",
+		},
+	}
+	identifier, _ := json.Marshal(icp)
+
+	resources := make([]*any.Any, 0)
+	for _, input := range configInputs {
+		resources = append(resources, networkingutil.MessageToAny(newXdsClientConfig(input)))
+	}
+
+	return &xdsapi.DiscoveryResponse{
+		VersionInfo: "1.1",
+		TypeUrl:     clientConfigType,
+		Resources:   resources,
+		ControlPlane: &envoycorev3.ControlPlane{
+			Identifier: string(identifier),
 		},
 	}
 }

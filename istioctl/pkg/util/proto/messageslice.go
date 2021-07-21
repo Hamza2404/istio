@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,14 +17,14 @@ package proto
 import (
 	"bytes"
 
-	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
+	"github.com/golang/protobuf/jsonpb"
 )
 
-// MessageSlice allows us to marshal slices of protobuf messages like clusters/listeners/routes correctly
+// MessageSlice allows us to marshal slices of protobuf messages like clusters/listeners/routes/endpoints correctly
 type MessageSlice []proto.Message
 
-// MarshalJSON handles marshalling of slices of proto messages
+// MarshalJSON handles marshaling of slices of proto messages
 func (pSlice MessageSlice) MarshalJSON() ([]byte, error) {
 	buffer := bytes.NewBufferString("[")
 	sliceLength := len(pSlice)

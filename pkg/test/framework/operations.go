@@ -1,4 +1,4 @@
-//  Copyright 2018 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -15,46 +15,30 @@
 package framework
 
 import (
-	"os"
 	"testing"
 
-	"istio.io/istio/pkg/log"
-	"istio.io/istio/pkg/test/framework/dependency"
-	env "istio.io/istio/pkg/test/framework/environment"
+	"istio.io/istio/pkg/test/framework/label"
 )
 
-var scope = log.RegisterScope("testframework", "General scope for the test framework", 0)
-var lab = log.RegisterScope("testframework-lab", "Scope for normal log reporting to be used by the lab", 0)
+// Run runs the given test.
+func Run(t *testing.T, fn func(ctx TestContext)) {
+	NewTest(t).Run(fn)
+}
 
-var d = newDriver()
+// NewContext creates a new test context and returns. It is up to the caller to close to context by calling
+// .Done() at the end of the test run.
+func NewContext(goTest *testing.T, labels ...label.Instance) TestContext {
+	return newRootContext(nil, goTest, labels...)
+}
 
-// Run is a helper for executing test main with appropriate resource allocation/doCleanup steps.
-// It allows us to do post-run doCleanup, and flag parsing.
-func Run(testID string, m *testing.M) {
-	exitcode, err := d.Run(testID, m)
-	if err != nil {
-		scope.Errorf("test.Run: %v", err)
+// newRootContext creates a new TestContext that has no parent. Delegates to the global runtime.
+func newRootContext(test *testImpl, goTest *testing.T, labels ...label.Instance) *testContext {
+	rtMu.Lock()
+	defer rtMu.Unlock()
+
+	if rt == nil {
+		panic("call to scope without running the test framework")
 	}
-	os.Exit(exitcode)
-}
 
-// SuiteRequires indicates that the whole suite requires particular dependencies.
-func SuiteRequires(_ *testing.M, dependencies ...dependency.Instance) {
-	if err := d.SuiteRequires(dependencies); err != nil {
-		panic(err)
-	}
-}
-
-// Requires ensures that the given dependencies will be satisfied. If they cannot, then the
-// test will fail.
-func Requires(t testing.TB, dependencies ...dependency.Instance) {
-	t.Helper()
-	d.Requires(t, dependencies)
-}
-
-// AcquireEnvironment resets and returns the environment. Once AcquireEnvironment should be called exactly
-// once per test.
-func AcquireEnvironment(t testing.TB) env.Environment {
-	t.Helper()
-	return d.AcquireEnvironment(t)
+	return rt.newRootContext(test, goTest, label.NewSet(labels...))
 }
